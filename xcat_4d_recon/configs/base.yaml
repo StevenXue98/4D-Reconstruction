@@ -1,0 +1,39 @@
+project_root: .
+
+# ── Data paths ────────────────────────────────────────────────────────────────
+data:
+  dir: ./data
+  gt_volumes_dir: ./data/ground_truth/volumes
+  gt_masks_dir: ./data/ground_truth/tumor_masks
+  unsorted_slabs_dir: ./data/unsort_ct_slabs
+  sorted_4dct_dir: ./data/sorted_4dct
+  rpm_signal: ./data/rpm_signal.txt
+  time_indices: ./data/timeIndicesPerSliceAndPhase.txt
+  dynamic_image_files: ./data/dynamic_image_files.txt
+  surrogate_rpm_grad: ./data/surrogate_rpm_grad.txt
+  surrogate_phase_derived: ./data/surrogate_phase_derived.txt
+  ref_image: ./data/ref_empty_image.nii.gz
+
+# ── Dataset properties ────────────────────────────────────────────────────────
+dataset:
+  n_timepoints: 182
+  voxel_shape: [355, 280, 115]           # (x, y, z)
+  voxel_spacing_mm: [1.0, 1.0, 3.0]     # mm per voxel
+  n_respiratory_phases: 10
+  train_frac: 0.80                        # first 80% → train
+
+# ── PCA dimensionality reduction ──────────────────────────────────────────────
+pca:
+  n_components: 64
+  batch_size: 10                          # IncrementalPCA batch size (# volumes)
+  artifacts_dir: ./artifacts
+  basis_file: ./artifacts/pca_basis.npz
+  mask_basis_file: ./artifacts/pca_mask_basis.npz
+  normalisation_file: ./artifacts/normalisation.json
+
+# ── Outputs ───────────────────────────────────────────────────────────────────
+outputs:
+  dir: ./outputs
+
+# ── Reproducibility ───────────────────────────────────────────────────────────
+seed: 42

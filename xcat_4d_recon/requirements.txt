@@ -1,0 +1,31 @@
+# ── Core scientific stack ──────────────────────────────────────────────────────
+numpy>=1.24
+scipy>=1.10
+scikit-learn>=1.3
+scikit-image>=0.21
+
+# ── Medical imaging ────────────────────────────────────────────────────────────
+nibabel>=5.1
+
+# ── Deep learning ─────────────────────────────────────────────────────────────
+torch>=2.1                         # CPU or CUDA
+# torch with CUDA: pip install torch --index-url https://download.pytorch.org/whl/cu121
+
+# ── MTTDE-specific ────────────────────────────────────────────────────────────
+geomloss>=0.2.6                    # Wasserstein / energy distance loss
+k-means-constrained>=0.7.3        # Balanced k-means for patch generation
+teaspoon>=1.4.0                   # MI_for_delay, FNN_n (optional; heuristic fallback if absent)
+
+# ── DeepONet / scientific ML ──────────────────────────────────────────────────
+# deepxde is bundled under Reference codebases/deepxde-master/.
+# To use the installed version instead: pip install deepxde>=1.10
+
+# ── Visualisation ─────────────────────────────────────────────────────────────
+matplotlib>=3.7
+tqdm>=4.65
+
+# ── Configuration ─────────────────────────────────────────────────────────────
+pyyaml>=6.0
+
+# ── Testing ───────────────────────────────────────────────────────────────────
+pytest>=7.4

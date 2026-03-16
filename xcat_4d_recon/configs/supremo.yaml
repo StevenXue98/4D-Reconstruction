@@ -1,0 +1,30 @@
+# SuPReMo baseline configuration
+# Reference: 4DCT-irregular-motion-main (MICCAI 2024)
+
+supremo:
+  # Path to compiled SuPReMo binary (Linux only; use Docker on macOS)
+  binary: ../Reference codebases/4DCT-irregular-motion-main/runSupremo
+  animate_binary: ../Reference codebases/4DCT-irregular-motion-main/animate
+
+  # Shared flags
+  n_threads: 4
+  similarity_measure: SSD                  # Sum of Squared Differences
+  b_spline_spacing: 20                     # mm, control point spacing
+  transformation_type: B-Spline
+
+  # Per-variant flag overrides (see methods/supremo/variants.py)
+  variants:
+    surrogate_driven:
+      optimizer_type: 0
+      surrogate_file: ./data/surrogate_rpm_grad.txt
+      output_dir: ./outputs/surr_driven
+
+    surrogate_free:
+      optimizer_type: 2
+      surrogate_file: ./data/surrogate_phase_derived.txt
+      output_dir: ./outputs/surr_free
+
+    surrogate_optimized:
+      optimizer_type: 2
+      surrogate_file: ./data/surrogate_rpm_grad.txt
+      output_dir: ./outputs/surr_optimized

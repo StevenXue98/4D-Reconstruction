@@ -1,0 +1,45 @@
+# Measure-Theoretic Time-Delay Embedding configuration
+# Adapted from: Measure-Theoretic-Time-Delay-Embedding-main
+
+mttde:
+  # ── Surrogate signal extraction ─────────────────────────────────────────────
+  surrogate:
+    method: pca_mode        # options: "pca_mode" | "mean_hu"
+    # pca_mode: project each CT slab onto PCA component 0 (lung motion proxy)
+    # mean_hu: average HU inside a lung bounding box in each CT slab
+    lung_bbox: [50, 200, 80, 230, 0, 115]   # [x0,x1,y0,y1,z0,z1], used by mean_hu
+    delay_params_file: ./artifacts/delay_params.json
+
+  # ── Time-delay embedding parameters ────────────────────────────────────────
+  embedding:
+    tau: null               # null → auto-detect via MI_for_delay
+    n: null                 # null → auto-detect via FNN_n
+    tau_max: 20             # upper bound for MI search
+    n_max: 10               # upper bound for FNN search
+    fnn_threshold: 5        # % threshold for FNN_n
+    subsample_skip: 1       # stride when computing MI/FNN (1 = use all points)
+
+  # ── Patch generation ────────────────────────────────────────────────────────
+  patches:
+    n_patches: 20           # must evenly divide number of training delay vectors
+    random_state: 0
+    max_iter: 100
+    patches_file: ./artifacts/mttde_patches.pkl
+
+  # ── Network architecture ────────────────────────────────────────────────────
+  network:
+    hidden_dim: 100
+    n_hidden_layers: 4
+    activation: tanh
+
+  # ── Training ────────────────────────────────────────────────────────────────
+  training:
+    n_iterations: 50000
+    learning_rate: 1.0e-3
+    loss_type: energy       # options: "energy" | "sinkhorn"
+    log_every: 500
+    checkpoint_every: 5000
+    checkpoint_dir: ./outputs/mttde/checkpoints
+
+  # ── Output ──────────────────────────────────────────────────────────────────
+  output_dir: ./outputs/mttde

@@ -1,0 +1,32 @@
+# DeepONet (POD-DeepONet) configuration
+# Uses deepxde library with PyTorch backend
+
+deeponet:
+  # ── Branch network input ────────────────────────────────────────────────────
+  branch_input:
+    method: delay_vector    # options: "delay_vector" | "slab_subsample"
+    # delay_vector: same 1D surrogate delay embedding as MTTDE (fair comparison)
+    # slab_subsample: flatten + subsample CT slab to fixed length m
+    slab_subsample_m: 512   # number of spatial samples if using slab_subsample
+
+  # ── POD-DeepONet architecture ───────────────────────────────────────────────
+  # Pod basis is fixed from PCA (pca_basis.npz); branch net predicts coefficients
+  branch_net:
+    hidden_dims: [256, 256, 256]
+    activation: relu
+
+  n_pca_components: 64      # must match base.yaml pca.n_components
+
+  # ── Training ────────────────────────────────────────────────────────────────
+  training:
+    n_epochs: 500
+    batch_size: 32
+    learning_rate: 1.0e-3
+    lr_scheduler: cosine    # options: "cosine" | "step" | "none"
+    weight_decay: 1.0e-5
+    log_every: 10
+    checkpoint_every: 50
+    checkpoint_dir: ./outputs/deeponet/checkpoints
+
+  # ── Output ──────────────────────────────────────────────────────────────────
+  output_dir: ./outputs/deeponet
