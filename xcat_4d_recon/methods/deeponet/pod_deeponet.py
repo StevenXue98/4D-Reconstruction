@@ -1,16 +1,33 @@
 """
-POD-DeepONet for 4D CT volume reconstruction.
+POD-DeepONet with CNN branch for 4D volume reconstruction.
 
-In the Proper Orthogonal Decomposition (POD) variant of DeepONet:
-  - The trunk basis is fixed to the PCA (POD) modes from the data.
-  - The branch network learns to predict PCA coefficients from input data.
-  - Reconstruction: volume = coefficients @ pca_components + pca_mean
+Architecture
+------------
+Branch network (CNN)
+    Input  : (batch, n_delay, H, W)
+             n_delay channels — one downsampled projection image per Takens delay step.
+             H × W is the training resolution (e.g. 15×15), but the network is
+             resolution-invariant: AdaptiveAvgPool2d collapses any spatial size to a
+             fixed (pool_size × pool_size) feature map, so the same weights can process
+             larger projection images at inference without retraining.
+    Output : (batch, n_pca) — PCA coefficient vector
 
-This is equivalent to standard DeepONet but with a physics-informed trunk
-derived from SVD/PCA of the training data, dramatically reducing the output
-dimensionality from 11M voxels to n_pca coefficients.
+Trunk (fixed POD basis)
+    The trunk is NOT a network — it is the fixed PCA basis computed from the
+    training volumes (Proper Orthogonal Decomposition modes).  This is the
+    POD-DeepONet variant: the trunk basis is data-derived rather than learned,
+    which gives the best linear approximation in L2 for a given number of modes.
 
-Reference: Lu et al. (2022) "A comprehensive and fair comparison of two neural
+Reconstruction
+    volume = coefficients @ pca_components + pca_mean
+
+Resolution invariance
+    The branch CNN processes any (H, W) input because AdaptiveAvgPool2d(pool_size)
+    always outputs a pool_size × pool_size spatial map regardless of input size.
+    Train on n×n downsampled projections; at inference pass full-resolution images
+    without any architectural change.
+
+Reference: Lu et al. (2022), "A comprehensive and fair comparison of two neural
 operators (with practical extensions) based on FAIR benchmarks."
 """
 
@@ -23,82 +40,90 @@ import torch
 import torch.nn as nn
 
 
-class BranchNet(nn.Module):
-    """Branch network encoding the input function to PCA coefficient space.
+class BranchCNN(nn.Module):
+    """CNN branch: (batch, n_delay, H, W) → (batch, n_pca).
+
+    Processes n_delay projection images as channels of a 2D image.
+    Three conv layers with ReLU, followed by AdaptiveAvgPool2d and a linear head.
+    The adaptive pooling layer is what confers input-resolution invariance.
 
     Parameters
     ----------
-    input_dim:
-        Dimensionality of the branch input (e.g., embedding_dim for delay_vector,
-        or slab_subsample_m for slab_subsample).
-    hidden_dims:
-        List of hidden layer widths.
-    output_dim:
-        Number of PCA components (= n_pca).
-    activation:
-        ``"relu"`` or ``"tanh"``.
+    n_delay:
+        Number of delay images stacked as input channels (Takens embedding dim).
+    n_pca:
+        Output dimensionality (number of PCA / POD components).
+    base_channels:
+        Number of feature maps in the first conv layer; doubled at each stage.
+    pool_size:
+        Spatial size of the adaptive pooling output.  Controls the capacity of
+        the feature vector fed to the linear head:
+        feature_dim = base_channels * 4 * pool_size * pool_size.
     """
 
     def __init__(
         self,
-        input_dim: int,
-        hidden_dims: list[int],
-        output_dim: int,
-        activation: str = "relu",
+        n_delay: int,
+        n_pca: int,
+        base_channels: int = 32,
+        pool_size: int = 4,
     ) -> None:
         super().__init__()
-        act_cls = nn.ReLU if activation == "relu" else nn.Tanh
-        layers: list[nn.Module] = [nn.Linear(input_dim, hidden_dims[0]), act_cls()]
-        for i in range(len(hidden_dims) - 1):
-            layers += [nn.Linear(hidden_dims[i], hidden_dims[i + 1]), act_cls()]
-        layers.append(nn.Linear(hidden_dims[-1], output_dim))
-        self.net = nn.Sequential(*layers)
+        c1, c2, c3 = base_channels, base_channels * 2, base_channels * 4
+        self.conv = nn.Sequential(
+            nn.Conv2d(n_delay, c1, kernel_size=3, padding=1), nn.ReLU(),
+            nn.Conv2d(c1, c2, kernel_size=3, padding=1),      nn.ReLU(),
+            nn.Conv2d(c2, c3, kernel_size=3, padding=1),      nn.ReLU(),
+        )
+        # Collapses any (H, W) → (pool_size, pool_size): resolution invariant
+        self.pool = nn.AdaptiveAvgPool2d((pool_size, pool_size))
+        self.head = nn.Linear(c3 * pool_size * pool_size, n_pca)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        return self.net(x)
+        """x: (batch, n_delay, H, W) → (batch, n_pca)"""
+        x = self.conv(x)          # (batch, c3, H, W)
+        x = self.pool(x)          # (batch, c3, pool_size, pool_size)
+        x = x.flatten(1)          # (batch, c3 * pool_size * pool_size)
+        return self.head(x)       # (batch, n_pca)
 
 
 class PODDeepONet(nn.Module):
-    """POD-DeepONet with fixed PCA trunk for high-dimensional volume reconstruction.
-
-    The model predicts the PCA coefficient vector for a query timepoint given
-    the branch input (delay embedding or CT slab).  The full volume is then
-    reconstructed as a linear combination of PCA modes.
+    """POD-DeepONet: CNN branch over projection stacks, fixed POD trunk.
 
     Parameters
     ----------
-    branch_input_dim:
-        Size of branch network input.
-    hidden_dims:
-        Hidden layer widths for the branch network.
+    n_delay:
+        Takens embedding dimension (number of delay images).
     n_pca:
-        Number of PCA components.
+        Number of PCA / POD modes.
     pca_components:
         Shape (n_pca, n_voxels).  Fixed trunk basis (not trained).
     pca_mean:
         Shape (n_voxels,).  Per-voxel mean.
-    activation:
-        Activation for branch net.
+    base_channels:
+        Conv feature maps at first stage (doubles per stage).
+    pool_size:
+        Adaptive pooling output size.
     """
 
     def __init__(
         self,
-        branch_input_dim: int,
-        hidden_dims: list[int],
+        n_delay: int,
         n_pca: int,
         pca_components: Optional[np.ndarray] = None,
         pca_mean: Optional[np.ndarray] = None,
-        activation: str = "relu",
+        base_channels: int = 32,
+        pool_size: int = 4,
     ) -> None:
         super().__init__()
         self.n_pca = n_pca
-        self.branch = BranchNet(branch_input_dim, hidden_dims, n_pca, activation)
+        self.branch = BranchCNN(n_delay, n_pca, base_channels, pool_size)
 
         if pca_components is not None:
             self.register_buffer(
                 "pca_components",
                 torch.tensor(pca_components, dtype=torch.float32),
-            )  # (n_pca, n_voxels)
+            )
         else:
             self.pca_components = None
 
@@ -106,18 +131,18 @@ class PODDeepONet(nn.Module):
             self.register_buffer(
                 "pca_mean",
                 torch.tensor(pca_mean, dtype=torch.float32),
-            )  # (n_voxels,)
+            )
         else:
             self.pca_mean = None
 
     def forward_coefficients(self, branch_input: torch.Tensor) -> torch.Tensor:
-        """Predict PCA coefficients only (efficient for training with MSE loss).
+        """Predict PCA coefficients.
 
         Parameters
         ----------
-        branch_input: shape (batch, branch_input_dim)
+        branch_input: (batch, n_delay, H, W)
 
-        Returns: shape (batch, n_pca)
+        Returns: (batch, n_pca)
         """
         return self.branch(branch_input)
 
@@ -126,51 +151,24 @@ class PODDeepONet(nn.Module):
         branch_input: torch.Tensor,
         return_volume: bool = False,
     ) -> torch.Tensor:
-        """Predict PCA coefficients, and optionally reconstruct full volume.
+        """Predict PCA coefficients, optionally reconstruct full volume.
 
         Parameters
         ----------
-        branch_input: shape (batch, branch_input_dim)
-        return_volume: if True, reconstruct full volume (expensive).
+        branch_input: (batch, n_delay, H, W)
+        return_volume: if True, reconstruct full volume (expensive for large volumes).
 
         Returns
         -------
-        If return_volume=False: coefficients, shape (batch, n_pca)
-        If return_volume=True:  volumes, shape (batch, n_voxels)
+        If return_volume=False: coefficients (batch, n_pca)
+        If return_volume=True:  volumes (batch, n_voxels)
         """
-        coeffs = self.branch(branch_input)  # (batch, n_pca)
+        coeffs = self.branch(branch_input)
         if not return_volume:
             return coeffs
-
         if self.pca_components is None:
             raise RuntimeError("pca_components must be provided to reconstruct volumes.")
-        # Linear combination: (batch, n_pca) @ (n_pca, n_voxels) + (n_voxels,)
-        volumes = coeffs @ self.pca_components  # (batch, n_voxels)
+        volumes = coeffs @ self.pca_components
         if self.pca_mean is not None:
             volumes = volumes + self.pca_mean.unsqueeze(0)
         return volumes
-
-    def reconstruct_volume_np(
-        self,
-        coefficients: np.ndarray,
-        volume_shape: tuple[int, ...],
-        pca_components: Optional[np.ndarray] = None,
-        pca_mean: Optional[np.ndarray] = None,
-    ) -> np.ndarray:
-        """Reconstruct a 3D volume from PCA coefficients (numpy, for inference).
-
-        Parameters
-        ----------
-        coefficients: shape (n_pca,)
-        volume_shape: e.g. (355, 280, 115)
-        pca_components: optional override
-        pca_mean: optional override
-
-        Returns: shape volume_shape, float32
-        """
-        comps = pca_components if pca_components is not None else self.pca_components.cpu().numpy()
-        mean = pca_mean if pca_mean is not None else (
-            self.pca_mean.cpu().numpy() if self.pca_mean is not None else np.zeros(comps.shape[1])
-        )
-        flat = coefficients @ comps + mean  # (n_voxels,)
-        return flat.reshape(volume_shape).astype(np.float32)

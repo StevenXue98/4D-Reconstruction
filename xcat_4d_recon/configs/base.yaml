@@ -31,6 +31,14 @@ pca:
   mask_basis_file: ./artifacts/pca_mask_basis.npz
   normalisation_file: ./artifacts/normalisation.json
 
+# ── 2D Projections (simulated cameras around the volume) ──────────────────────
+projections:
+  enabled: true
+  output_dir: ./data/projections
+  n_angles: 6               # number of camera positions
+  angle_start: 0.0          # first camera angle in degrees
+  angle_range: 180.0        # total angular span in degrees (180 = non-redundant parallel-beam)
+
 # ── Outputs ───────────────────────────────────────────────────────────────────
 outputs:
   dir: ./outputs

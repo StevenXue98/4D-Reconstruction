@@ -1,115 +1,91 @@
 """
-PyTorch Dataset for POD-DeepONet training on 4D XCAT data.
+PyTorch Dataset for POD-DeepONet training on 4D reconstruction data.
 
 Each sample corresponds to one training timepoint and provides:
-  - branch_input : 1-D vector encoding the acquired data at that timepoint
-                   (either a delay-coordinate vector or a sub-sampled CT slab).
-  - target_coeffs: PCA coefficients of the ground-truth volume.
+  - branch_input  : (n_delay, H, W) float32 tensor — n_delay downsampled
+                    projection images stacked as channels, at delays
+                    [t, t-τ, t-2τ, ..., t-(n-1)τ].  H × W is the training
+                    projection resolution (e.g. 15×15).
+  - target_coeffs : (n_pca,) float32 tensor — PCA coefficients of the
+                    ground-truth volume at timepoint t.
 
-The trunk (POD basis) is fixed and not part of per-sample data.
+All projection images are loaded at dataset initialisation (they are small
+.npy files) and kept in memory.  PCA coefficients are provided as a
+pre-computed array (computed once by fit_pca.py / run_deeponet.py).
 """
 
 from __future__ import annotations
 
 from pathlib import Path
-from typing import Optional
 
-import nibabel as nib
 import numpy as np
 import torch
 from torch.utils.data import Dataset
+from tqdm import tqdm
 
 
-class CT4DDataset(Dataset):
-    """Dataset mapping timepoint → (branch_input, pca_coefficients).
+class ProjectionDataset(Dataset):
+    """Dataset mapping timepoint → (projection_stack, pca_coefficients).
 
     Parameters
     ----------
     timepoint_indices:
-        List of timepoint indices to include (e.g., training split).
+        Timepoints in this split.  Must satisfy ``t >= (n_delay-1)*tau`` for all t.
+    proj_small_dir:
+        Directory containing ``proj_small_<vol:03d>_angle_<a:02d>.npy`` files.
+    angle_idx:
+        Camera angle index to use.
     pca_coefficients:
         Pre-computed PCA coefficients, shape (n_total_timepoints, n_pca).
-    branch_method:
-        ``"delay_vector"`` – use pre-computed delay embedding vectors.
-        ``"slab_subsample"`` – load and subsample CT slabs.
-    delay_matrix:
-        Shape (n_aligned, n_embedding).  Required for ``"delay_vector"``.
-        Row i corresponds to timepoint (n-1)*tau + i in the original signal.
-    delay_offset:
-        Number of samples trimmed at the start of the surrogate signal when
-        building the delay matrix (= (n-1)*tau).  Used to align delay rows with
-        timepoint indices.
-    slab_dir:
-        Directory containing slab_*.nii.gz (required for ``"slab_subsample"``).
-    slab_subsample_m:
-        Number of voxels to randomly sub-sample from each slab.
-    subsample_seed:
-        RNG seed for reproducible sub-sampling.
+    tau:
+        Takens time delay (samples).
+    n_delay:
+        Takens embedding dimension — number of delay images stacked.
     """
 
     def __init__(
         self,
         timepoint_indices: list[int],
+        proj_small_dir: str,
+        angle_idx: int,
         pca_coefficients: np.ndarray,
-        branch_method: str = "delay_vector",
-        delay_matrix: Optional[np.ndarray] = None,
-        delay_offset: int = 0,
-        slab_dir: Optional[str] = None,
-        slab_subsample_m: int = 512,
-        subsample_seed: int = 42,
+        tau: int,
+        n_delay: int,
     ) -> None:
         self.indices = timepoint_indices
         self.pca_coefficients = pca_coefficients.astype(np.float32)
-        self.branch_method = branch_method
-        self.delay_matrix = delay_matrix
-        self.delay_offset = delay_offset
-        self.slab_dir = Path(slab_dir) if slab_dir else None
-        self.slab_subsample_m = slab_subsample_m
 
-        if branch_method == "delay_vector":
-            if delay_matrix is None:
-                raise ValueError("delay_matrix is required for branch_method='delay_vector'.")
+        proj_small_dir = Path(proj_small_dir)
 
-        elif branch_method == "slab_subsample":
-            if slab_dir is None:
-                raise ValueError("slab_dir is required for branch_method='slab_subsample'.")
-            # Pre-compute fixed random sub-sample indices (consistent across timepoints)
-            rng = np.random.RandomState(subsample_seed)
-            # We don't know slab shape yet; sub-sampling is done lazily
-            self._rng = rng
-            self._slab_idx_cache: dict[int, np.ndarray] = {}
+        # ── Load all projection stacks upfront ────────────────────────────────
+        # Each stack is (n_delay, H, W) — the H×W spatial image at each delay step.
+        # Stored in a dict for O(1) access by timepoint index.
+        self.branch_inputs: dict[int, np.ndarray] = {}
+        proj_shape: tuple[int, int] | None = None
+
+        for t in tqdm(timepoint_indices, desc="Loading projection stacks", leave=False):
+            stack = []
+            for j in range(n_delay):
+                vol_idx = t - j * tau
+                path = proj_small_dir / f"proj_small_{vol_idx:03d}_angle_{angle_idx:02d}.npy"
+                img = np.load(str(path)).astype(np.float32)
+                if proj_shape is None:
+                    proj_shape = img.shape
+                stack.append(img)
+            # Shape: (n_delay, H, W)
+            self.branch_inputs[t] = np.stack(stack, axis=0)
+
+        h, w = proj_shape or (0, 0)
+        print(
+            f"ProjectionDataset: {len(timepoint_indices)} timepoints  "
+            f"branch shape=({n_delay}, {h}, {w})  n_pca={pca_coefficients.shape[1]}"
+        )
 
     def __len__(self) -> int:
         return len(self.indices)
 
     def __getitem__(self, idx: int) -> tuple[torch.Tensor, torch.Tensor]:
         t = self.indices[idx]
-
-        # ── Branch input ──────────────────────────────────────────────────────
-        if self.branch_method == "delay_vector":
-            row = t - self.delay_offset
-            if row < 0 or row >= len(self.delay_matrix):
-                raise IndexError(
-                    f"Timepoint {t} maps to delay_matrix row {row}, which is out of bounds "
-                    f"(delay_matrix has {len(self.delay_matrix)} rows).  "
-                    "Check that delay_offset = (n-1)*tau matches the trimmed delay matrix."
-                )
-            branch = torch.tensor(self.delay_matrix[row], dtype=torch.float32)
-
-        elif self.branch_method == "slab_subsample":
-            slab_path = self.slab_dir / f"slab_{t}.nii.gz"
-            slab = nib.load(str(slab_path)).get_fdata().astype(np.float32).ravel()
-            n_voxels = len(slab)
-            if t not in self._slab_idx_cache:
-                self._slab_idx_cache[t] = self._rng.choice(
-                    n_voxels, size=min(self.slab_subsample_m, n_voxels), replace=False
-                )
-            branch = torch.tensor(slab[self._slab_idx_cache[t]], dtype=torch.float32)
-
-        else:
-            raise ValueError(f"Unknown branch_method: {self.branch_method!r}")
-
-        # ── Target PCA coefficients ───────────────────────────────────────────
+        branch = torch.tensor(self.branch_inputs[t], dtype=torch.float32)
         target = torch.tensor(self.pca_coefficients[t], dtype=torch.float32)
-
         return branch, target

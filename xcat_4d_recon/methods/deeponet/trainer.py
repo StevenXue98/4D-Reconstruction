@@ -1,9 +1,9 @@
 """
-Training loop for POD-DeepONet on 4D CT reconstruction.
+Training loop for POD-DeepONet on 4D volume reconstruction.
 
-Trains the branch network to minimise MSE between predicted and true PCA
+Trains the CNN branch to minimise MSE between predicted and true PCA
 coefficients.  Training in PCA coefficient space is equivalent to a
-weighted MSE in voxel space (weighted by explained variance).
+weighted voxel-space MSE (weighted by explained variance per mode).
 """
 
 from __future__ import annotations
@@ -41,10 +41,12 @@ def train_deeponet(
         Initialised PODDeepONet.
     train_loader:
         DataLoader yielding (branch_input, target_coefficients) batches.
+        branch_input       : (B, n_delay, H, W)
+        target_coefficients: (B, n_pca)
     n_epochs:
-        Number of full passes over the training data.
+        Number of full passes over training data.
     lr_scheduler:
-        ``"cosine"`` (cosine annealing), ``"step"`` (step decay), or ``"none"``.
+        ``"cosine"``, ``"step"``, or ``"none"``.
     checkpoint_dir:
         If set, save .pth checkpoints here.
 
@@ -78,11 +80,11 @@ def train_deeponet(
         batch_losses: list[float] = []
 
         for branch_input, target in train_loader:
-            branch_input = branch_input.to(device)
-            target = target.to(device)
+            branch_input = branch_input.to(device)   # (B, n_delay, H, W)
+            target = target.to(device)               # (B, n_pca)
 
             optimizer.zero_grad()
-            pred = model.forward_coefficients(branch_input)
+            pred = model.forward_coefficients(branch_input)   # (B, n_pca)
             loss = loss_fn(pred, target)
             loss.backward()
             optimizer.step()
@@ -112,15 +114,10 @@ def train_deeponet(
 
     print(f"Training complete.  Final epoch loss={epoch_losses[-1]:.6e}")
 
-    # Save final model
     if checkpoint_dir:
         final_path = Path(checkpoint_dir) / "deeponet_final.pth"
         torch.save(
-            {
-                "epoch": n_epochs,
-                "model_state_dict": model.state_dict(),
-                "epoch_losses": epoch_losses,
-            },
+            {"epoch": n_epochs, "model_state_dict": model.state_dict(), "epoch_losses": epoch_losses},
             final_path,
         )
         print(f"Saved final model → {final_path}")
@@ -128,12 +125,8 @@ def train_deeponet(
     return model.cpu(), epoch_losses
 
 
-def load_deeponet(
-    checkpoint_path: str,
-    model: PODDeepONet,
-    device: str = "cpu",
-) -> PODDeepONet:
-    """Load a saved PODDeepONet checkpoint into an existing model instance."""
+def load_deeponet(checkpoint_path: str, model: PODDeepONet, device: str = "cpu") -> PODDeepONet:
+    """Load a saved PODDeepONet checkpoint."""
     ckpt = torch.load(checkpoint_path, map_location=device)
     model.load_state_dict(ckpt["model_state_dict"])
     model.eval()

@@ -3,7 +3,7 @@ Step 3a: Train and evaluate the Measure-Theoretic Time-Delay Embedding method.
 
 Full pipeline:
   1. Load PCA basis.
-  2. Extract 1D surrogate signal from CT slabs (no data leakage from GT).
+  2. Extract 1D surrogate signal from 2D projection images (one camera angle).
   3. Estimate time-delay embedding parameters (tau, n) or load from cache.
   4. Build delay-coordinate matrix and encode training volumes.
   5. Build constrained k-means patches.
@@ -12,7 +12,7 @@ Full pipeline:
 
 Usage:
     python experiments/run_mttde.py
-    python experiments/run_mttde.py --n_iterations 50000 --n_components 64
+    python experiments/run_mttde.py --n_iterations 50000 --angle_idx 0
 """
 
 from __future__ import annotations
@@ -22,6 +22,7 @@ import sys
 from glob import glob
 from pathlib import Path
 
+import nibabel as nib
 import numpy as np
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
@@ -51,11 +52,12 @@ def main():
     parser.add_argument("--train_frac", type=float, default=0.80)
     # PCA
     parser.add_argument("--n_components", type=int, default=64)
-    # Surrogate
-    parser.add_argument("--surrogate_method", default="pca_mode",
-                        choices=["pca_mode", "mean_hu"])
-    parser.add_argument("--lung_bbox", type=int, nargs=6, default=[50, 200, 80, 230, 0, 115],
-                        metavar=("X0", "X1", "Y0", "Y1", "Z0", "Z1"))
+    # Surrogate — projection-based
+    parser.add_argument("--projections_dir", default=None,
+                        help="Directory containing projection .npy files "
+                             "(default: <data_dir>/projections)")
+    parser.add_argument("--angle_idx", type=int, default=0,
+                        help="Which camera angle to use for surrogate extraction (default: 0)")
     # Embedding
     parser.add_argument("--tau", type=int, default=None, help="Override delay tau")
     parser.add_argument("--n_embed", type=int, default=None, help="Override embedding dim n")
@@ -77,38 +79,33 @@ def main():
     data_dir = Path(args.data_dir)
     artifacts_dir = Path(args.artifacts_dir)
     output_dir = Path(args.output_dir)
+    projections_dir = Path(args.projections_dir) if args.projections_dir else data_dir / "projections"
     n_train = int(args.n_timepoints * args.train_frac)
     test_indices = list(range(n_train, args.n_timepoints))
     print(f"Train: 0..{n_train-1}  Test: {n_train}..{args.n_timepoints-1}")
 
     # ── 1. Load PCA ───────────────────────────────────────────────────────────
-    basis_file = str(artifacts_dir / "pca_basis.npz")
     pca = PCAReduction(n_components=args.n_components)
-    pca.load(basis_file)
+    pca.load(str(artifacts_dir / "pca_basis.npz"))
 
-    # ── 2. Extract surrogate signal from CT slabs ─────────────────────────────
-    slabs_dir = data_dir / "unsort_ct_slabs"
-    all_slab_paths = _sorted_paths(str(slabs_dir), "slab_")
-    if not all_slab_paths:
-        raise FileNotFoundError(f"No slab files found in {slabs_dir}. Run prepare_data.py first.")
-
-    print("\nExtracting 1D surrogate signal from CT slabs ...")
-    surrogate = extract_surrogate(
-        slab_paths=all_slab_paths,
-        method=args.surrogate_method,
-        pca_mean=pca.mean if args.surrogate_method == "pca_mode" else None,
-        pca_component0=pca.components[0] if args.surrogate_method == "pca_mode" else None,
-        volume_shape=pca._volume_shape,
-        lung_bbox=args.lung_bbox,
+    # ── 2. Extract surrogate signal from projection images ────────────────────
+    proj_paths = sorted(
+        projections_dir.glob(f"proj_*_angle_{args.angle_idx:02d}.npy"),
+        key=lambda p: int(p.stem.split("_")[1]),
     )
+    if not proj_paths:
+        raise FileNotFoundError(
+            f"No projection files found in {projections_dir} for angle_idx={args.angle_idx}.\n"
+            "Run: python experiments/prepare_data.py"
+        )
+    proj_paths = [str(p) for p in proj_paths]
+    print(f"\nExtracting 1D surrogate from {len(proj_paths)} projections "
+          f"(camera angle index {args.angle_idx}) ...")
+    surrogate = extract_surrogate(proj_paths)
     print(f"Surrogate signal shape: {surrogate.shape}")
 
-    # Normalise surrogate
     scale = float(np.max(np.abs(surrogate)))
-    if scale > 0:
-        surrogate_norm = surrogate / scale
-    else:
-        surrogate_norm = surrogate.copy()
+    surrogate_norm = surrogate / scale if scale > 0 else surrogate.copy()
 
     # ── 3. Compute embedding parameters ──────────────────────────────────────
     delay_params_file = str(artifacts_dir / "delay_params.json")
@@ -126,8 +123,6 @@ def main():
     print("\nBuilding delay matrix ...")
     delay_matrix_full = build_delay_matrix(surrogate_norm, tau, n_embed)
     trim = (n_embed - 1) * tau
-    # Align: row i of delay_matrix_full corresponds to timepoint (trim + i)
-    # Training samples: timepoints trim..n_train-1
     train_delay = delay_matrix_full[: n_train - trim]
 
     print("Encoding training volumes with PCA ...")
@@ -136,44 +131,36 @@ def main():
     if not gt_paths:
         raise FileNotFoundError(f"No GT volumes in {gt_volumes_dir}")
 
-    train_gt_paths = gt_paths[trim:n_train]  # aligned with delay matrix rows
-    pca_coefficients = pca.encode_many(train_gt_paths)  # (N_train_aligned, n_pca)
+    train_gt_paths = gt_paths[trim:n_train]
+    pca_coefficients = pca.encode_many(train_gt_paths)
     print(f"PCA coefficient matrix: {pca_coefficients.shape}")
 
     # ── 5. Build patches ──────────────────────────────────────────────────────
-    patches_file = str(artifacts_dir / "mttde_patches.pkl")
     patch_inputs, patch_outputs = build_patches(
         delay_coords=train_delay,
         pca_coefficients=pca_coefficients,
         n_patches=args.n_patches,
-        patches_file=patches_file,
+        patches_file=str(artifacts_dir / "mttde_patches.pkl"),
     )
 
     # ── 6. Train ──────────────────────────────────────────────────────────────
-    checkpoint_dir = str(output_dir / "checkpoints")
     net, loss_history = train_mttde(
         patch_inputs=patch_inputs,
         patch_outputs=patch_outputs,
         input_dim=n_embed,
-        output_dim=args.n_components,
+        output_dim=pca.n_components,
         hidden_dim=args.hidden_dim,
         n_hidden_layers=args.n_hidden_layers,
         loss_type=args.loss_type,
         n_iterations=args.n_iterations,
         learning_rate=args.learning_rate,
-        checkpoint_dir=checkpoint_dir,
+        checkpoint_dir=str(output_dir / "checkpoints"),
         seed=args.seed,
         device=args.device,
     )
-
-    # Save loss history
     np.save(str(output_dir / "loss_history.npy"), np.array(loss_history))
 
     # ── 7. Predict on test split ──────────────────────────────────────────────
-    ref_path = str(gt_paths[0])
-    import nibabel as nib
-    ref_affine = nib.load(ref_path).affine
-
     predict_mttde(
         net=net,
         pca=pca,
@@ -182,7 +169,7 @@ def main():
         n=n_embed,
         test_indices=test_indices,
         output_dir=str(output_dir),
-        ref_affine=ref_affine,
+        ref_affine=nib.load(gt_paths[0]).affine,
     )
 
     print("\nMTTDE pipeline complete.")

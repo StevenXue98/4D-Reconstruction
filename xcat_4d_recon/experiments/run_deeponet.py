@@ -2,16 +2,24 @@
 Step 3b: Train and evaluate the POD-DeepONet reconstruction method.
 
 Full pipeline:
-  1. Load PCA basis.
-  2. Prepare branch inputs (delay vectors matching MTTDE for fair comparison,
-     or CT slab sub-samples).
-  3. Encode training volumes to PCA coefficients.
-  4. Train POD-DeepONet branch network (MSE in PCA coefficient space).
-  5. Predict on test timepoints and save NIfTI volumes.
+  1. Downsample 2D projection images to (proj_n × proj_n) via Gaussian-smoothed
+     resize.  proj_n controls the tradeoff between training speed, denoising,
+     and spatial detail retained in the branch input.
+  2. Extract 1D surrogate from projections to determine Takens τ and n.
+  3. Build branch inputs: for each timepoint t, stack n downsampled projection
+     images at delays [t, t-τ, ..., t-(n-1)τ] → (n, proj_n, proj_n) tensor.
+  4. Encode training volumes with PCA (POD trunk basis).
+  5. Train CNN branch: (n, proj_n, proj_n) → n_pca coefficients, MSE loss.
+  6. Predict on test timepoints (optionally at full resolution) → NIfTI volumes.
+
+Resolution invariance
+  The CNN branch uses AdaptiveAvgPool2d and therefore accepts any (H, W) input.
+  To run inference at full resolution, set --inference_full_res.
 
 Usage:
     python experiments/run_deeponet.py
-    python experiments/run_deeponet.py --branch_method slab_subsample --n_epochs 500
+    python experiments/run_deeponet.py --proj_n 20 --n_epochs 500
+    python experiments/run_deeponet.py --proj_n 15 --inference_full_res
 """
 
 from __future__ import annotations
@@ -29,9 +37,10 @@ from torch.utils.data import DataLoader
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 from preprocessing.pca_reduction import PCAReduction
+from preprocessing.generate_projections import downsample_projections
 from methods.mttde.surrogate_extraction import extract_surrogate
-from methods.mttde.delay_embedding import compute_embedding_params, build_delay_matrix
-from methods.deeponet.dataset import CT4DDataset
+from methods.mttde.delay_embedding import compute_embedding_params
+from methods.deeponet.dataset import ProjectionDataset
 from methods.deeponet.pod_deeponet import PODDeepONet
 from methods.deeponet.trainer import train_deeponet
 from methods.deeponet.predictor import predict_deeponet
@@ -41,6 +50,23 @@ def _sorted_paths(directory: str, prefix: str) -> list[str]:
     paths = glob(str(Path(directory) / f"{prefix}*.nii.gz"))
     paths.sort(key=lambda p: int(Path(p).stem.split("_")[-1].split(".")[0]))
     return paths
+
+
+def _load_proj_stack(
+    proj_dir: Path,
+    t: int,
+    tau: int,
+    n_delay: int,
+    angle_idx: int,
+    prefix: str = "proj_small_",
+) -> np.ndarray:
+    """Load n_delay projection images for timepoint t → (n_delay, H, W)."""
+    stack = []
+    for j in range(n_delay):
+        vol_idx = t - j * tau
+        path = proj_dir / f"{prefix}{vol_idx:03d}_angle_{angle_idx:02d}.npy"
+        stack.append(np.load(str(path)).astype(np.float32))
+    return np.stack(stack, axis=0)
 
 
 def main():
@@ -54,18 +80,33 @@ def main():
     parser.add_argument("--train_frac", type=float, default=0.80)
     # PCA
     parser.add_argument("--n_components", type=int, default=64)
-    # Branch input
-    parser.add_argument("--branch_method", default="delay_vector",
-                        choices=["delay_vector", "slab_subsample"])
-    parser.add_argument("--slab_subsample_m", type=int, default=512)
-    parser.add_argument("--surrogate_method", default="pca_mode",
-                        choices=["pca_mode", "mean_hu"])
-    # Network
-    parser.add_argument("--hidden_dims", type=int, nargs="+", default=[256, 256, 256])
-    parser.add_argument("--activation", default="relu", choices=["relu", "tanh"])
+    # Projection / observation
+    parser.add_argument("--projections_dir", default=None,
+                        help="Directory of full-res projection .npy files "
+                             "(default: <data_dir>/projections)")
+    parser.add_argument("--angle_idx", type=int, default=0,
+                        help="Camera angle index to use (default: 0)")
+    # Downsampling resolution — key tradeoff knob
+    parser.add_argument("--proj_n", type=int, default=15,
+                        help="Projection is downsampled to (proj_n × proj_n) before "
+                             "feeding to the branch CNN.  Larger = more spatial detail "
+                             "but slower training.  (default: 15)")
+    # Inference resolution
+    parser.add_argument("--inference_full_res", action="store_true",
+                        help="At inference, pass full-resolution projections to the CNN "
+                             "instead of the downsampled ones.  The CNN's adaptive "
+                             "pooling handles any input size.")
+    # Delay embedding (cached from MTTDE run if available)
+    parser.add_argument("--tau", type=int, default=None)
+    parser.add_argument("--n_embed", type=int, default=None)
+    # CNN architecture
+    parser.add_argument("--base_channels", type=int, default=32,
+                        help="Feature maps in first conv layer (default: 32)")
+    parser.add_argument("--pool_size", type=int, default=4,
+                        help="AdaptiveAvgPool2d output size (default: 4)")
     # Training
     parser.add_argument("--n_epochs", type=int, default=500)
-    parser.add_argument("--batch_size", type=int, default=32)
+    parser.add_argument("--batch_size", type=int, default=8)
     parser.add_argument("--learning_rate", type=float, default=1e-3)
     parser.add_argument("--weight_decay", type=float, default=1e-5)
     parser.add_argument("--lr_scheduler", default="cosine",
@@ -80,77 +121,74 @@ def main():
     data_dir = Path(args.data_dir)
     artifacts_dir = Path(args.artifacts_dir)
     output_dir = Path(args.output_dir)
+    projections_dir = Path(args.projections_dir) if args.projections_dir else data_dir / "projections"
+    proj_small_dir = projections_dir / f"small_{args.proj_n}x{args.proj_n}"
+
     n_train = int(args.n_timepoints * args.train_frac)
     test_indices = list(range(n_train, args.n_timepoints))
     print(f"Train: 0..{n_train-1}  Test: {n_train}..{args.n_timepoints-1}")
 
-    # ── 1. Load PCA ───────────────────────────────────────────────────────────
-    basis_file = str(artifacts_dir / "pca_basis.npz")
-    pca = PCAReduction(n_components=args.n_components)
-    pca.load(basis_file)
+    # ── 1. Downsample projections ─────────────────────────────────────────────
+    if not proj_small_dir.exists() or not any(proj_small_dir.glob("proj_small_*.npy")):
+        print(f"\nDownsampling projections to {args.proj_n}×{args.proj_n} ...")
+        downsample_projections(
+            input_dir=str(projections_dir),
+            output_dir=str(proj_small_dir),
+            target_h=args.proj_n,
+            target_w=args.proj_n,
+        )
+    else:
+        print(f"Downsampled projections ({args.proj_n}×{args.proj_n}) already exist, skipping.")
 
-    # ── 2. Encode ALL training volumes to PCA coefficients ────────────────────
+    # ── 2. Estimate Takens τ and n ────────────────────────────────────────────
+    proj_paths = sorted(
+        projections_dir.glob(f"proj_*_angle_{args.angle_idx:02d}.npy"),
+        key=lambda p: int(p.stem.split("_")[1]),
+    )
+    if not proj_paths:
+        raise FileNotFoundError(
+            f"No projection files found in {projections_dir} for angle_idx={args.angle_idx}.\n"
+            "Run: python experiments/prepare_data.py"
+        )
+    print(f"\nExtracting 1D surrogate from {len(proj_paths)} full-res projections ...")
+    surrogate = extract_surrogate([str(p) for p in proj_paths])
+    scale = float(np.max(np.abs(surrogate)))
+    surrogate_norm = surrogate / scale if scale > 0 else surrogate.copy()
+
+    delay_params_file = str(artifacts_dir / "delay_params.json")
+    tau, n_embed = compute_embedding_params(
+        signal=surrogate_norm[:n_train],
+        tau_override=args.tau,
+        n_override=args.n_embed,
+        delay_params_file=delay_params_file,
+    )
+    trim = (n_embed - 1) * tau
+    train_indices = list(range(trim, n_train))
+    valid_test = [t for t in test_indices if t >= trim]
+    print(f"tau={tau}, n={n_embed}  →  branch input: ({n_embed}, {args.proj_n}, {args.proj_n})")
+
+    # ── 3. Load PCA basis and encode training volumes ─────────────────────────
+    pca = PCAReduction(n_components=args.n_components)
+    pca.load(str(artifacts_dir / "pca_basis.npz"))
+
     gt_volumes_dir = data_dir / "ground_truth" / "volumes"
     gt_paths = _sorted_paths(str(gt_volumes_dir), "volume_")
     if not gt_paths:
         raise FileNotFoundError(f"No GT volumes in {gt_volumes_dir}")
 
     print("\nEncoding training volumes with PCA ...")
-    all_pca_coeffs = pca.encode_many(gt_paths[:n_train])  # (n_train, n_pca)
-    # Pad to full n_timepoints length (test entries unused but keeps indexing simple)
-    full_pca_coeffs = np.zeros((args.n_timepoints, args.n_components), dtype=np.float32)
+    all_pca_coeffs = pca.encode_many(gt_paths[:n_train])
+    full_pca_coeffs = np.zeros((args.n_timepoints, pca.n_components), dtype=np.float32)
     full_pca_coeffs[:n_train] = all_pca_coeffs
 
-    # ── 3. Prepare branch inputs ──────────────────────────────────────────────
-    delay_matrix = None
-    delay_offset = 0
-    branch_input_dim = args.n_components  # placeholder, updated below
-
-    if args.branch_method == "delay_vector":
-        # Re-use MTTDE embedding (fair comparison)
-        slabs_dir = data_dir / "unsort_ct_slabs"
-        all_slab_paths = _sorted_paths(str(slabs_dir), "slab_")
-        print("\nExtracting 1D surrogate signal ...")
-        surrogate = extract_surrogate(
-            slab_paths=all_slab_paths,
-            method=args.surrogate_method,
-            pca_mean=pca.mean if args.surrogate_method == "pca_mode" else None,
-            pca_component0=pca.components[0] if args.surrogate_method == "pca_mode" else None,
-            volume_shape=pca._volume_shape,
-        )
-        scale = float(np.max(np.abs(surrogate)))
-        surrogate_norm = surrogate / scale if scale > 0 else surrogate
-
-        delay_params_file = str(artifacts_dir / "delay_params.json")
-        tau, n_embed = compute_embedding_params(
-            signal=surrogate_norm[:n_train],
-            delay_params_file=delay_params_file,  # load cached if exists
-        )
-        delay_matrix = build_delay_matrix(surrogate_norm, tau, n_embed)
-        delay_offset = (n_embed - 1) * tau
-        branch_input_dim = n_embed
-        print(f"Branch input: delay vector (tau={tau}, n={n_embed}, dim={branch_input_dim})")
-
-    elif args.branch_method == "slab_subsample":
-        branch_input_dim = args.slab_subsample_m
-        print(f"Branch input: slab sub-sample (m={branch_input_dim})")
-
-    # ── 4. Build dataset and DataLoader ──────────────────────────────────────
-    # Training indices must be in the valid range of the delay matrix
-    if args.branch_method == "delay_vector":
-        train_indices = list(range(delay_offset, n_train))
-    else:
-        train_indices = list(range(n_train))
-
-    train_dataset = CT4DDataset(
+    # ── 4. Build dataset and train ────────────────────────────────────────────
+    train_dataset = ProjectionDataset(
         timepoint_indices=train_indices,
+        proj_small_dir=str(proj_small_dir),
+        angle_idx=args.angle_idx,
         pca_coefficients=full_pca_coeffs,
-        branch_method=args.branch_method,
-        delay_matrix=delay_matrix,
-        delay_offset=delay_offset,
-        slab_dir=str(data_dir / "unsort_ct_slabs"),
-        slab_subsample_m=args.slab_subsample_m,
-        subsample_seed=args.seed,
+        tau=tau,
+        n_delay=n_embed,
     )
     train_loader = DataLoader(
         train_dataset,
@@ -160,20 +198,17 @@ def main():
     )
     print(f"Training dataset: {len(train_dataset)} samples")
 
-    # ── 5. Build POD-DeepONet model ───────────────────────────────────────────
     model = PODDeepONet(
-        branch_input_dim=branch_input_dim,
-        hidden_dims=args.hidden_dims,
-        n_pca=args.n_components,
+        n_delay=n_embed,
+        n_pca=pca.n_components,
         pca_components=pca.components,
         pca_mean=pca.mean,
-        activation=args.activation,
+        base_channels=args.base_channels,
+        pool_size=args.pool_size,
     )
     n_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
-    print(f"POD-DeepONet branch net: {n_params:,} trainable parameters")
+    print(f"POD-DeepONet CNN branch: {n_params:,} trainable parameters")
 
-    # ── 6. Train ──────────────────────────────────────────────────────────────
-    checkpoint_dir = str(output_dir / "checkpoints")
     model, epoch_losses = train_deeponet(
         model=model,
         train_loader=train_loader,
@@ -181,72 +216,46 @@ def main():
         learning_rate=args.learning_rate,
         weight_decay=args.weight_decay,
         lr_scheduler=args.lr_scheduler,
-        checkpoint_dir=checkpoint_dir,
+        checkpoint_dir=str(output_dir / "checkpoints"),
         device=args.device,
     )
+    output_dir.mkdir(parents=True, exist_ok=True)
     np.save(str(output_dir / "epoch_losses.npy"), np.array(epoch_losses))
 
-    # ── 7. Predict on test split ──────────────────────────────────────────────
-    ref_affine = nib.load(gt_paths[0]).affine
-
-    if args.branch_method == "delay_vector":
-        # Build branch inputs for all timepoints from delay matrix
-        # test_indices in delay_matrix alignment: t - delay_offset
-        valid_test = [t for t in test_indices if (t - delay_offset) < len(delay_matrix)]
-        branch_inputs = delay_matrix.astype(np.float32)  # (T - trim, n_embed)
-
-        # predict_deeponet expects branch_inputs indexed by t directly; adjust
-        # by building a padded array indexed by absolute timepoint
-        padded = np.zeros((args.n_timepoints, n_embed), dtype=np.float32)
-        for t in range(delay_offset, args.n_timepoints):
-            if t - delay_offset < len(delay_matrix):
-                padded[t] = delay_matrix[t - delay_offset]
-
-        predict_deeponet(
-            model=model,
-            pca=pca,
-            branch_inputs=padded,
-            test_indices=valid_test,
-            output_dir=str(output_dir),
-            ref_affine=ref_affine,
-        )
+    # ── 5. Build branch inputs for test timepoints ────────────────────────────
+    # Choose inference resolution: full-res or training-res projections.
+    if args.inference_full_res:
+        inf_dir = projections_dir
+        inf_prefix = "proj_"
+        print(f"\nInference at full resolution (from {inf_dir})")
     else:
-        # slab_subsample: build branch inputs on the fly in predict_deeponet
-        # Use a simple loop via dataset
-        _predict_slab_subsample(
-            model, pca, train_dataset, test_indices, output_dir, ref_affine, args
-        )
+        inf_dir = proj_small_dir
+        inf_prefix = "proj_small_"
+        print(f"\nInference at training resolution ({args.proj_n}×{args.proj_n})")
+
+    print("Building branch inputs for test timepoints ...")
+    # Determine shape from first test timepoint
+    sample_stack = _load_proj_stack(inf_dir, valid_test[0], tau, n_embed,
+                                    args.angle_idx, inf_prefix)
+    _, H_inf, W_inf = sample_stack.shape
+    branch_inputs = np.zeros(
+        (args.n_timepoints, n_embed, H_inf, W_inf), dtype=np.float32
+    )
+    for t in valid_test:
+        branch_inputs[t] = _load_proj_stack(inf_dir, t, tau, n_embed,
+                                             args.angle_idx, inf_prefix)
+
+    # ── 6. Predict on test split ──────────────────────────────────────────────
+    predict_deeponet(
+        model=model,
+        pca=pca,
+        branch_inputs=branch_inputs,
+        test_indices=valid_test,
+        output_dir=str(output_dir),
+        ref_affine=nib.load(gt_paths[0]).affine,
+    )
 
     print("\nDeepONet pipeline complete.")
-
-
-def _predict_slab_subsample(model, pca, train_dataset, test_indices, output_dir, ref_affine, args):
-    """Fallback predictor for slab_subsample branch method (builds inputs lazily)."""
-    import nibabel as nib
-    vol_dir = Path(output_dir) / "estimated_volumes"
-    vol_dir.mkdir(parents=True, exist_ok=True)
-
-    from methods.deeponet.dataset import CT4DDataset
-    from pathlib import Path as P
-    from tqdm import tqdm
-
-    slabs_dir = Path(args.data_dir) / "unsort_ct_slabs"
-
-    model.eval()
-    for t in tqdm(test_indices, desc="DeepONet predict"):
-        test_ds = CT4DDataset(
-            timepoint_indices=[t],
-            pca_coefficients=np.zeros((args.n_timepoints, args.n_components)),
-            branch_method="slab_subsample",
-            slab_dir=str(slabs_dir),
-            slab_subsample_m=args.slab_subsample_m,
-            subsample_seed=args.seed,
-        )
-        branch, _ = test_ds[0]
-        with torch.no_grad():
-            coeffs = model.forward_coefficients(branch.unsqueeze(0)).squeeze(0).numpy()
-        volume = pca.decode(coeffs)
-        nib.nifti1.save(nib.Nifti1Image(volume, ref_affine), str(vol_dir / f"volume_{t}.nii.gz"))
 
 
 if __name__ == "__main__":
